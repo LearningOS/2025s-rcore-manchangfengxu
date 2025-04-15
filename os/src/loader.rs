@@ -82,6 +82,10 @@ pub fn load_apps() {
         };
         let dst = unsafe { core::slice::from_raw_parts_mut(base_i as *mut u8, src.len()) };
         dst.copy_from_slice(src);
+
+
+
+
     }
     // Memory fence about fetching the instruction memory
     // It is guaranteed that a subsequent instruction fetch must
