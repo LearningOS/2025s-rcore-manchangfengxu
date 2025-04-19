@@ -113,6 +113,11 @@ impl VirtAddr {
     pub fn aligned(&self) -> bool {
         self.page_offset() == 0
     }
+    
+    /// Align the virtual address to the floor page boundary by dividing by page size
+    pub fn to_floor_aligned(&mut self) {
+        self.0 = (self.0 / PAGE_SIZE + 1) * PAGE_SIZE;
+    }
 }
 impl From<VirtAddr> for VirtPageNum {
     fn from(v: VirtAddr) -> Self {

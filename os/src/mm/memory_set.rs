@@ -63,6 +63,22 @@ impl MemorySet {
             None,
         );
     }
+
+    /// Delete a framed area from memory set
+    /// 
+    /// # Arguments
+    /// 
+    /// * `start_va` - The start virtual address of the area to delete
+    /// * `end_va` - The end virtual address of the area to delete
+    pub fn delete_framed_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
+        if let Some(area) = self
+            .areas
+            .iter_mut()
+            .find(|area| area.vpn_range.get_start() == start_va.floor() && area.vpn_range.get_end() == end_va.floor()){
+                area.unmap(&mut self.page_table);
+            }
+    }
+    
     fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
         map_area.map(&mut self.page_table);
         if let Some(data) = data {

@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{MapPermission, PageTableEntry, VirtAddr, VirtPageNum};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -151,6 +152,69 @@ impl TaskManager {
             // go back to user mode
         } else {
             panic!("All applications completed!");
+        }
+    }
+
+    /// Get the current running task's id
+    /// 
+    /// Returns the id of the task that is currently running
+    pub fn get_current_task(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        let id = inner.current_task;
+        drop(inner);
+        id
+    }
+    
+    /// Insert a new memory area into the task's memory set
+    /// 
+    /// # Arguments
+    /// 
+    /// * `task_id` - The ID of the task to insert the memory area into
+    /// * `start_va` - The starting virtual address of the memory area
+    /// * `end_va` - The ending virtual address of the memory area  
+    /// * `permission` - The access permissions for the memory area
+    pub fn insert_maparea(&self, task_id: usize, start_va: VirtAddr, end_va: VirtAddr, permission: MapPermission) -> isize{
+        let mut inner = self.inner.exclusive_access();
+        inner.tasks[task_id].memory_set.insert_framed_area(start_va, end_va, permission);
+        return 0;
+    }
+
+    /// Delete a memory area from the task's memory set
+    /// 
+    /// # Arguments
+    /// 
+    /// * `task_id` - The ID of the task to delete the memory area from
+    /// * `start_va` - The starting virtual address of the memory area to delete
+    /// * `end_va` - The ending virtual address of the memory area to delete
+    /// 
+    /// # Returns
+    /// 
+    /// Returns 0 on success
+    pub fn delete_maparea(&self, task_id: usize, start_va: VirtAddr, end_va: VirtAddr) -> isize{
+        let mut inner = self.inner.exclusive_access();
+        inner.tasks[task_id].memory_set.delete_framed_area(start_va, end_va);
+        drop(inner);
+        return 0;
+    }
+
+    /// Get the page table entry for a virtual address in a task's address space
+    /// 
+    /// # Arguments
+    /// 
+    /// * `task_id` - The ID of the task to look up the page table entry for
+    /// * `vaddr` - The virtual address to look up
+    /// 
+    /// # Returns
+    /// 
+    /// Returns Some(pte) if the virtual address is mapped, None otherwise
+    pub fn get_pte(&self, task_id: usize, vpn: VirtPageNum) -> Option<PageTableEntry>{
+        let inner = self.inner.exclusive_access();
+        if let Some(pte) = inner.tasks[task_id].memory_set.translate(vpn){
+            drop(inner);
+            return Some(pte);
+        }else {
+            drop(inner);
+            return None;
         }
     }
 }
