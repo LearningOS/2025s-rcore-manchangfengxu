@@ -115,8 +115,12 @@ impl VirtAddr {
     }
     
     /// Align the virtual address to the floor page boundary by dividing by page size
+    pub fn to_ceil_aligned(&mut self) {
+        self.0 = (self.0 - 1 + PAGE_SIZE) / PAGE_SIZE * PAGE_SIZE;
+    }
+    /// Align the virtual address to the ceil page boundary by dividing by page size
     pub fn to_floor_aligned(&mut self) {
-        self.0 = (self.0 / PAGE_SIZE + 1) * PAGE_SIZE;
+        self.0 = self.0 / PAGE_SIZE * PAGE_SIZE;
     }
 }
 impl From<VirtAddr> for VirtPageNum {

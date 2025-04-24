@@ -74,7 +74,7 @@ impl MemorySet {
         if let Some(area) = self
             .areas
             .iter_mut()
-            .find(|area| area.vpn_range.get_start() == start_va.floor() && area.vpn_range.get_end() == end_va.floor()){
+            .find(|area| (area.vpn_range.get_start() == start_va.floor()) && (area.vpn_range.get_end() == end_va.floor())){
                 area.unmap(&mut self.page_table);
             }
     }
