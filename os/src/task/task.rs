@@ -8,7 +8,10 @@ use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefMut;
+use core::cmp::Ordering;
 
+/// big stride
+pub const BIG_STRIDE:isize = 1024;
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -22,12 +25,19 @@ pub struct TaskControlBlock {
 
     /// Mutable
     inner: UPSafeCell<TaskControlBlockInner>,
+
+    /// the stride schedule of the current process
+    stride_schedule: UPSafeCell<StrideSchedule>,
 }
 
 impl TaskControlBlock {
     /// Get the mutable reference of the inner TCB
     pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
+    }
+    /// Get the mutable reference of the schedule
+    pub fn schedule_exclusive_access(&self) -> RefMut<'_, StrideSchedule>{
+        self.stride_schedule.exclusive_access()
     }
     /// Get the address of app's page table
     pub fn get_user_token(&self) -> usize {
@@ -36,6 +46,49 @@ impl TaskControlBlock {
     }
 }
 
+impl PartialEq for TaskControlBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.pid.0 == other.pid.0
+    }
+}
+
+impl Eq for TaskControlBlock {}
+
+impl PartialOrd for TaskControlBlock {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TaskControlBlock {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // We want smaller stride to have higher priority, but BinaryHeap is a max-heap.
+        // So we reverse the comparison order.
+        let self_stride = self.schedule_exclusive_access().stride;
+        let other_stride = other.schedule_exclusive_access().stride;
+        other_stride.cmp(&self_stride)
+    }
+}
+/// The scheduling strategy
+pub struct StrideSchedule {
+    pub stride: isize,
+    pub priority: isize,
+    pub pass: isize,
+}
+
+impl StrideSchedule {
+    pub fn new() -> Self {
+        Self {
+            stride: 0,
+            priority: 16,
+            pass: 0,
+        }
+    }
+
+    pub fn set_pass(&mut self) {
+        self.pass = BIG_STRIDE / self.priority;
+    }
+}
 pub struct TaskControlBlockInner {
     /// The physical page number of the frame where the trap context is placed
     pub trap_cx_ppn: PhysPageNum,
@@ -106,6 +159,7 @@ impl TaskControlBlock {
         let task_control_block = Self {
             pid: pid_handle,
             kernel_stack,
+            stride_schedule: unsafe { UPSafeCell::new(StrideSchedule::new()) },
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
                     trap_cx_ppn,
@@ -179,6 +233,7 @@ impl TaskControlBlock {
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
             kernel_stack,
+            stride_schedule: unsafe { UPSafeCell::new(StrideSchedule::new()) },
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
                     trap_cx_ppn,
@@ -206,6 +261,18 @@ impl TaskControlBlock {
         // ---- release parent PCB
     }
 
+    /// parent process fork the process from elf
+    pub fn fork_elf(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self>{
+        // ---- access parent PCB exclusively
+        let mut parent_inner = self.inner_exclusive_access();
+        let task_control_block= Arc::new(TaskControlBlock::new(elf_data));
+        let mut inner = task_control_block.inner_exclusive_access();
+        inner.parent = Some(Arc::downgrade(self));
+        drop(inner);
+        // add child
+        parent_inner.children.push(task_control_block.clone());
+        task_control_block
+    }
     /// get pid of process
     pub fn getpid(&self) -> usize {
         self.pid.0
@@ -237,6 +304,7 @@ impl TaskControlBlock {
         }
     }
 }
+
 
 #[derive(Copy, Clone, PartialEq)]
 /// task status: UnInit, Ready, Running, Exited

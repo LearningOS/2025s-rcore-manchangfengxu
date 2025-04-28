@@ -1,6 +1,7 @@
 //! Process management syscalls
+use crate::{mm::{MapPermission, VirtAddr, VirtPageNum}, timer::get_time_us};
 use alloc::sync::Arc;
-
+const VA_WIDTH_SV39: usize = 39;
 use crate::{
     loader::get_app_data_by_name,
     mm::{translated_refmut, translated_str},
@@ -67,7 +68,11 @@ pub fn sys_exec(path: *const u8) -> isize {
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    trace!("kernel::pid[{}] sys_waitpid [{}]", current_task().unwrap().pid.0, pid);
+    trace!(
+        "kernel::pid[{}] sys_waitpid [{}]",
+        current_task().unwrap().pid.0,
+        pid
+    );
     let task = current_task().unwrap();
     // find a child process
 
@@ -110,7 +115,25 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
         "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    let vaddr: VirtAddr = (_ts as usize).into();
+    if vaddr.0 >= (1 << VA_WIDTH_SV39) {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if let Some(paddr) = inner.memory_set.translate_va(vaddr) {
+        let us = get_time_us();
+        unsafe {
+            *(paddr.0 as *mut TimeVal) = TimeVal {
+                sec: us / 1_000_000,
+                usec: us % 1_000_000,
+            };
+            0
+        }
+    } else {
+        -1
+    }
+    
 }
 
 /// YOUR JOB: Implement mmap.
@@ -119,7 +142,31 @@ pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
         "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    if ((_port & 0b111) == 0) || ((_port >> 3) > 0) {
+        return -1;
+    }
+    let vstart: VirtAddr = _start.into();
+    if !vstart.aligned() {
+        return -1;
+    }
+    let vend: VirtAddr = (_start + _len).into();
+    if vend.0 >= (1 << VA_WIDTH_SV39) {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    for i in vstart.floor().0..vend.ceil().0 {
+        if let Some(pte) = inner.memory_set.translate(VirtPageNum::from(i)) {
+            if pte.is_valid() {
+                return -1;
+            }
+        }
+    }
+    let permission = MapPermission::from_bits(((_port << 1) | 0b10000) as u8).unwrap();
+    inner
+        .memory_set
+        .insert_framed_area(vstart, vend, permission);
+    0
 }
 
 /// YOUR JOB: Implement munmap.
@@ -128,7 +175,26 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
         "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    let vstart: VirtAddr = _start.into();
+    if !vstart.aligned() {
+        return -1;
+    }
+    let vend: VirtAddr = (_start + _len).into();
+    if vend.0 >= (1 << VA_WIDTH_SV39) {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    for i in vstart.floor().0..vend.ceil().0 {
+        if let Some(pte) = inner.memory_set.translate(VirtPageNum::from(i)) {
+            if !pte.is_valid() {
+                return -1;
+            }
+        }
+    }
+
+    inner.memory_set.remove_area_with_start_vpn(vstart.floor());
+    0
 }
 
 /// change data segment size
@@ -148,7 +214,23 @@ pub fn sys_spawn(_path: *const u8) -> isize {
         "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, _path);
+    if let Some(data) = get_app_data_by_name(path.as_str()) {
+        let task = current_task().unwrap();
+        let new_task = task.fork_elf(data);
+        let new_pid = new_task.pid.0;
+        // modify trap context of new_task, because it returns immediately after switching
+        let trap_cx = new_task.inner_exclusive_access().get_trap_cx();
+        // we do not have to move to next instruction since we have done it before
+        // for child process, fork returns 0
+        trap_cx.x[10] = 0;
+        // add new task to scheduler
+        add_task(new_task);
+        new_pid as isize
+    } else {
+        -1
+    }
 }
 
 // YOUR JOB: Set task priority.
@@ -157,5 +239,13 @@ pub fn sys_set_priority(_prio: isize) -> isize {
         "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    if _prio <= 1 {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let mut schedule = task.schedule_exclusive_access();
+    schedule.priority = _prio;
+    schedule.set_pass();
+    drop(schedule);
+    0
 }

@@ -54,6 +54,19 @@ pub fn suspend_current_and_run_next() {
     schedule(task_cx_ptr);
 }
 
+// /// Suspend the current 'Running' task and run the next task in task list by stride schedule .
+// pub fn stride_schedule_run() {
+//     // There must be an application running.
+//     let task = take_current_task().unwrap();
+
+//     // ---- access current TCB exclusively
+//     let mut task_inner = task.inner_exclusive_access();
+//     // Change status to Ready
+//     task_inner.task_status = TaskStatus::Ready;
+//     drop(task_inner);
+    
+// }
+
 /// pid of usertests app in make run TEST=1
 pub const IDLE_PID: usize = 0;
 

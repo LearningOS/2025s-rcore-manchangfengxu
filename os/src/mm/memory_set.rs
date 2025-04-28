@@ -72,6 +72,11 @@ impl MemorySet {
             self.areas.remove(idx);
         }
     }
+    /// get the physical address from the virtual address
+    pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
+        self.page_table.translate_va(va)
+    }
+    
     /// Add a new MapArea into this MemorySet.
     /// Assuming that there are no conflicts in the virtual address
     /// space.
