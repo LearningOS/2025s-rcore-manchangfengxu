@@ -247,5 +247,5 @@ pub fn sys_set_priority(_prio: isize) -> isize {
     schedule.priority = _prio;
     schedule.set_pass();
     drop(schedule);
-    0
+    _prio
 }
