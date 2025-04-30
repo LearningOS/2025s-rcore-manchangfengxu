@@ -88,6 +88,10 @@ impl StrideSchedule {
     pub fn set_pass(&mut self) {
         self.pass = BIG_STRIDE / self.priority;
     }
+
+    pub fn stride_pass(&mut self) {
+        self.stride += self.pass;
+    }
 }
 pub struct TaskControlBlockInner {
     /// The physical page number of the frame where the trap context is placed

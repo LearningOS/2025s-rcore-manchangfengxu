@@ -20,6 +20,9 @@ impl TaskManager {
     }
     /// Add process back to ready queue
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
+        let mut schedule = task.schedule_exclusive_access();
+        schedule.stride_pass();
+        drop(schedule);
         self.ready_queue.push(task);
     }
     /// Take a process out of the ready queue
