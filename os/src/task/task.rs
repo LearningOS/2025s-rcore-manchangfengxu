@@ -10,7 +10,8 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
-
+use core::cmp::Ordering;
+const BIG_STRIDE: isize = 1024;
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -23,6 +24,7 @@ pub struct TaskControlBlock {
     pub kernel_stack: KernelStack,
 
     /// Mutable
+    schedule: UPSafeCell<StrideSchedule>,
     inner: UPSafeCell<TaskControlBlockInner>,
 }
 
@@ -35,6 +37,11 @@ impl TaskControlBlock {
     pub fn get_user_token(&self) -> usize {
         let inner = self.inner_exclusive_access();
         inner.memory_set.token()
+    }
+
+    /// Get the mutable reference of the schedule
+    pub fn schedule_exclusive_access(&self) -> RefMut<'_, StrideSchedule> {
+        self.schedule.exclusive_access()
     }
 }
 
@@ -95,7 +102,53 @@ impl TaskControlBlockInner {
         }
     }
 }
+impl PartialEq for TaskControlBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.pid.0 == other.pid.0
+    }
+}
 
+impl Eq for TaskControlBlock {}
+
+impl PartialOrd for TaskControlBlock {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TaskControlBlock {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // We want smaller stride to have higher priority, but BinaryHeap is a max-heap.
+        // So we reverse the comparison order.
+        let self_stride = self.schedule_exclusive_access().stride;
+        let other_stride = other.schedule_exclusive_access().stride;
+        other_stride.cmp(&self_stride)
+    }
+}
+/// The scheduling strategy
+pub struct StrideSchedule {
+    pub stride: isize,
+    pub priority: isize,
+    pub pass: isize,
+}
+
+impl StrideSchedule {
+    pub fn new() -> Self {
+        Self {
+            stride: 0,
+            priority: 16,
+            pass: 0,
+        }
+    }
+
+    pub fn set_pass(&mut self) {
+        self.pass = BIG_STRIDE / self.priority;
+    }
+
+    pub fn stride_pass(&mut self) {
+        self.stride += self.pass;
+    }
+}
 impl TaskControlBlock {
     /// Create a new process
     ///
@@ -115,6 +168,7 @@ impl TaskControlBlock {
         let task_control_block = Self {
             pid: pid_handle,
             kernel_stack,
+            schedule: unsafe { UPSafeCell::new(StrideSchedule::new()) },
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
                     trap_cx_ppn,
@@ -149,7 +203,18 @@ impl TaskControlBlock {
         );
         task_control_block
     }
-
+    /// parent process fork the process from elf
+    pub fn fork_elf(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self>{
+        // ---- access parent PCB exclusively
+        let mut parent_inner = self.inner_exclusive_access();
+        let task_control_block= Arc::new(TaskControlBlock::new(elf_data));
+        let mut inner = task_control_block.inner_exclusive_access();
+        inner.parent = Some(Arc::downgrade(self));
+        drop(inner);
+        // add child
+        parent_inner.children.push(task_control_block.clone());
+        task_control_block
+    }
     /// Load a new elf to replace the original application address space and start execution
     pub fn exec(&self, elf_data: &[u8]) {
         // memory_set with elf program headers/trampoline/trap context/user stack
@@ -203,6 +268,7 @@ impl TaskControlBlock {
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
             kernel_stack,
+            schedule: unsafe { UPSafeCell::new(StrideSchedule::new()) },
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
                     trap_cx_ppn,

@@ -1,8 +1,10 @@
 //! File and filesystem-related syscalls
-use crate::fs::{open_file, OpenFlags, Stat};
-use crate::mm::{translated_byte_buffer, translated_str, UserBuffer};
+use crate::fs::{
+    open_file, root_add_dir_entry, root_get_id, root_remove_dir_entry, OpenFlags, Stat,
+};
+use crate::mm::{translated_byte_buffer, translated_str, UserBuffer, VirtAddr};
 use crate::task::{current_task, current_user_token};
-
+const VA_WIDTH_SV39: usize = 39;
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
     trace!("kernel:pid[{}] sys_write", current_task().unwrap().pid.0);
     let token = current_user_token();
@@ -81,7 +83,28 @@ pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
         "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+
+    let vaddr: VirtAddr = (_st as usize).into();
+    if vaddr.0 >= (1 << VA_WIDTH_SV39) {
+        return -1;
+    }
+    
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if let Some(file) = &inner.fd_table[_fd] {
+        let stat = file.stat();
+        if let Some(paddr) = inner.memory_set.translate_va(vaddr) {
+            drop(inner);
+            unsafe {
+                *(paddr.0 as *mut Stat) = stat;
+                0
+            }
+        } else {
+            -1
+        }
+    } else {
+        -1
+    }
 }
 
 /// YOUR JOB: Implement linkat.
@@ -90,7 +113,32 @@ pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
         "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    let token = current_user_token();
+    let _old_name = translated_str(token, _old_name);
+    let _new_name = translated_str(token, _new_name);
+    if _old_name == _new_name {
+        return -1;
+    }
+    if let Some(old_inode) = open_file(_old_name.as_str(), OpenFlags::RDWR) {
+        let old = old_inode.inner_inode_exclusive_access();
+        if old.is_dir() {
+            drop(old);
+            return -1;
+        }
+        match root_get_id(_old_name.as_str()) {
+            Some(old_id) => {
+                old.inode_change_by_id(old_id, |inode| {
+                    inode.nlink += 1;
+                });
+                drop(old);
+                root_add_dir_entry(_new_name.as_str(), old_id);
+            }
+            None => return -1,
+        }
+        0
+    } else {
+        -1
+    }
 }
 
 /// YOUR JOB: Implement unlinkat.
@@ -99,5 +147,11 @@ pub fn sys_unlinkat(_name: *const u8) -> isize {
         "kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    let token = current_user_token();
+    let name = translated_str(token, _name);
+    if name.is_empty() {
+        return -1;
+    }
+    root_remove_dir_entry(name.as_str());
+    0
 }

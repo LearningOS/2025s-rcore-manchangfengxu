@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 use bitflags::*;
 use easy_fs::{EasyFileSystem, Inode};
 use lazy_static::*;
+use super::StatMode;
 
 /// inode in memory
 /// A wrapper around a filesystem inode
@@ -52,6 +53,21 @@ impl OSInode {
             v.extend_from_slice(&buffer[..len]);
         }
         v
+    }
+    /// get inner inode
+    pub fn inner_inode_exclusive_access(&self) -> Arc<Inode> {
+        self.inner.exclusive_access().inode.clone()
+    }
+    /// get stat mode
+    pub fn get_stat_mod(&self) -> StatMode  {
+        let inner = self.inner_inode_exclusive_access();
+        if inner.is_dir() {
+            StatMode::DIR
+        } else if inner.is_file() {
+            StatMode::FILE
+        }  else {
+            StatMode::NULL
+        }
     }
 }
 
@@ -99,6 +115,20 @@ impl OpenFlags {
             (true, true)
         }
     }
+}
+
+/// aaaa
+pub fn root_get_id(name: &str) -> Option<u32> {
+    ROOT_INODE.find_inode_id_by_self(name)
+}
+///
+pub fn root_add_dir_entry(name: &str, inode_id: u32) {
+    ROOT_INODE.add_dir_entry(name, inode_id);
+}
+
+///
+pub fn root_remove_dir_entry(name: &str) {
+    ROOT_INODE.remove_dir_entry(name);
 }
 
 /// Open a file
@@ -155,5 +185,18 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn stat(&self) -> super::Stat {
+        let inner = self.inner.exclusive_access();
+        let ino = inner.inode.my_inode_id();
+        let nlink = inner.inode.my_nlink();
+        drop(inner);
+        super::Stat {
+            dev: 0,
+            ino: ino as u64,
+            nlink: nlink,
+            mode: self.get_stat_mod(),
+            pad: [0;7],
+        }
     }
 }
