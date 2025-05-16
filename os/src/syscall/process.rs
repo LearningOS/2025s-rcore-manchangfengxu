@@ -1,13 +1,14 @@
 use crate::{
     fs::{open_file, OpenFlags},
-    mm::{translated_ref, translated_refmut, translated_str},
+    mm::{translated_ref, translated_refmut, translated_str, VirtAddr},
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
         suspend_current_and_run_next, SignalFlags,
     },
+    timer::get_time_us,
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
-
+const VA_WIDTH_SV39: usize = 39;
 #[repr(C)]
 #[derive(Debug)]
 pub struct TimeVal {
@@ -156,7 +157,24 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
         "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let vaddr: VirtAddr = (_ts as usize).into();
+    if vaddr.0 >= (1 << VA_WIDTH_SV39) {
+        return -1;
+    }
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if let Some(paddr) = inner.memory_set.translate_va(vaddr) {
+        let us = get_time_us();
+        unsafe {
+            *(paddr.0 as *mut TimeVal) = TimeVal {
+                sec: us / 1_000_000,
+                usec: us % 1_000_000,
+            };
+            0
+        }
+    } else {
+        -1
+    }
 }
 
 /// mmap syscall

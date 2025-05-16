@@ -43,12 +43,66 @@ pub struct ProcessControlBlockInner {
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     /// task resource allocator
     pub task_res_allocator: RecycleAllocator,
+    /// deadlock detection
+    pub enable_deadlock_detect: bool,
+    /// deadlock detect
+    pub mutex_deadlock_detect: MutexDeadlockDetect,
+    /// deadlock detect
+    pub semaphore_deadlock_detect: SemaphoreDeadlockDetect,
     /// mutex list
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
     /// semaphore list
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+}
+/// Mutex deadlock detect
+pub struct MutexDeadlockDetect {
+    pub available: Vec<usize>,
+    pub allocation: Vec<Vec<usize>>,
+    pub need: Vec<Vec<usize>>
+}
+impl Clone for MutexDeadlockDetect {
+    fn clone(&self) -> Self {
+        Self {
+            available: self.available.clone(),
+            allocation: self.allocation.clone(),
+            need: self.need.clone()
+        }
+    }
+}
+impl MutexDeadlockDetect {
+    pub fn new() -> Self {
+        Self {
+            available: Vec::new(),
+            allocation: vec![vec![0; 100] ; 100],
+            need: vec![vec![0; 100] ; 100]
+        }
+    }
+}
+/// Semaphore deadlock detect
+pub struct SemaphoreDeadlockDetect {
+    pub available: Vec<usize>,
+    pub allocation: Vec<Vec<usize>>,
+    pub need: Vec<Vec<usize>>
+}
+impl Clone for SemaphoreDeadlockDetect {
+    fn clone(&self) -> Self {
+        Self {
+            available: self.available.clone(),
+            allocation: self.allocation.clone(),
+            need: self.need.clone()
+        }
+    }
+}
+impl SemaphoreDeadlockDetect  {
+    pub fn new() -> Self {
+        Self {
+            available: Vec::new(),
+            allocation: vec![vec![0; 100] ; 100],
+            need: vec![vec![0; 100] ; 100]
+        }
+    }
 }
 
 impl ProcessControlBlockInner {
@@ -116,6 +170,9 @@ impl ProcessControlBlock {
                     signals: SignalFlags::empty(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
+                    enable_deadlock_detect: false,
+                    mutex_deadlock_detect: MutexDeadlockDetect::new(),
+                    semaphore_deadlock_detect: SemaphoreDeadlockDetect::new(),
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
@@ -242,6 +299,9 @@ impl ProcessControlBlock {
                     signals: SignalFlags::empty(),
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
+                    enable_deadlock_detect: parent.enable_deadlock_detect,
+                    mutex_deadlock_detect: parent.mutex_deadlock_detect.clone(),
+                    semaphore_deadlock_detect: parent.semaphore_deadlock_detect.clone(),
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
