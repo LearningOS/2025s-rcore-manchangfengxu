@@ -75,8 +75,8 @@ impl MutexDeadlockDetect {
     pub fn new() -> Self {
         Self {
             available: Vec::new(),
-            allocation: vec![vec![0; 100] ; 100],
-            need: vec![vec![0; 100] ; 100]
+            allocation: vec![vec![0; 20] ; 20],
+            need: vec![vec![0; 20] ; 20]
         }
     }
 }
@@ -99,8 +99,8 @@ impl SemaphoreDeadlockDetect  {
     pub fn new() -> Self {
         Self {
             available: Vec::new(),
-            allocation: vec![vec![0; 100] ; 100],
-            need: vec![vec![0; 100] ; 100]
+            allocation: vec![vec![0; 20] ; 20],
+            need: vec![vec![0; 20] ; 20]
         }
     }
 }

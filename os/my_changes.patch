@@ -1,31 +1,820 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 9f9a47e..e1c17a9 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -33,7 +33,6 @@ jobs:
+     steps:
+       - uses: actions/checkout@v4
+       - name: Run tests
+-        continue-on-error: true
+         run: |
+           qemu-system-riscv64 --version
+           rustup target add riscv64gc-unknown-none-elf
+@@ -94,9 +93,18 @@ jobs:
+             --argjson totalScore 500 \
+             '{channel: $channel, courseId: $courseId, name: $name, score: $score, totalScore: $totalScore}')
+ 
+-          curl -X POST $post_api \
++            response=$(curl -X POST $post_api \
+             -H "accept: application/json;charset=utf-8" \
+             -H "Content-Type: application/json" \
+             -H "token: $token" \
+             -d "$score_json" \
+-            -v
++            -v)
++
++            echo "Response: $response"
++
++            if echo "$response" | grep -q '"result":1'; then
++            echo "Success: The result field contains 1."
++            else
++            echo "Error: The result field does not contain 1."
++            exit 1
++            fi
+diff --git a/os/my_changes.patch b/os/my_changes.patch
+new file mode 100644
+index 0000000..97aab0d
+--- /dev/null
++++ b/os/my_changes.patch
+@@ -0,0 +1,31 @@
++diff --git a/os/src/syscall/sync.rs b/os/src/syscall/sync.rs
++index b991ac0..232dce0 100644
++--- a/os/src/syscall/sync.rs
+++++ b/os/src/syscall/sync.rs
++@@ -148,9 +148,9 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
++     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
++     drop(process_inner);
++     drop(process);
+++    mutex.lock();
++     process = current_process();
++     process_inner = process.inner_exclusive_access();
++-    mutex.lock();
++     if process_inner.enable_deadlock_detect {
++         let banker = &mut process_inner.mutex_deadlock_detect;
++         let tid = current_task_tid();
++@@ -251,6 +251,7 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
++         banker.available[sem_id] += 1;
++     }
++     drop(process_inner);
+++    drop(process);
++     0
++ }
++ /// semaphore down syscall
++@@ -299,6 +300,7 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
++         banker.available[sem_id] -= 1;
++     }
++     drop(process_inner);
+++    drop(process);
++     0
++ }
++ /// condvar create syscall
+diff --git a/os/src/mm/memory_set.rs b/os/src/mm/memory_set.rs
+index 6dc14aa..f2c7bae 100644
+--- a/os/src/mm/memory_set.rs
++++ b/os/src/mm/memory_set.rs
+@@ -258,7 +258,10 @@ impl MemorySet {
+     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
+         self.page_table.translate(vpn)
+     }
+-
++    /// get the physical address from the virtual address
++    pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
++        self.page_table.translate_va(va)
++    }
+     ///Remove all `MapArea`
+     pub fn recycle_data_pages(&mut self) {
+         self.areas.clear();
+diff --git a/os/src/syscall/process.rs b/os/src/syscall/process.rs
+index 01c5499..1f84ff3 100644
+--- a/os/src/syscall/process.rs
++++ b/os/src/syscall/process.rs
+@@ -1,13 +1,14 @@
+ use crate::{
+     fs::{open_file, OpenFlags},
+-    mm::{translated_ref, translated_refmut, translated_str},
++    mm::{translated_ref, translated_refmut, translated_str, VirtAddr},
+     task::{
+         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
+         suspend_current_and_run_next, SignalFlags,
+     },
++    timer::get_time_us,
+ };
+ use alloc::{string::String, sync::Arc, vec::Vec};
+-
++const VA_WIDTH_SV39: usize = 39;
+ #[repr(C)]
+ #[derive(Debug)]
+ pub struct TimeVal {
+@@ -156,7 +157,26 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+         "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
+         current_task().unwrap().process.upgrade().unwrap().getpid()
+     );
+-    -1
++    let vaddr: VirtAddr = (_ts as usize).into();
++    if vaddr.0 >= (1 << VA_WIDTH_SV39) {
++        return -1;
++    }
++    let process = current_process();
++    let inner = process.inner_exclusive_access();
++    if let Some(paddr) = inner.memory_set.translate_va(vaddr) {
++        drop(inner);
++        drop(process);
++        let us = get_time_us();
++        unsafe {
++            *(paddr.0 as *mut TimeVal) = TimeVal {
++                sec: us / 1_000_000,
++                usec: us % 1_000_000,
++            };
++            0
++        }
++    } else {
++        -1
++    }
+ }
+ 
+ /// mmap syscall
 diff --git a/os/src/syscall/sync.rs b/os/src/syscall/sync.rs
-index b991ac0..232dce0 100644
+index 290ee6f..232dce0 100644
 --- a/os/src/syscall/sync.rs
 +++ b/os/src/syscall/sync.rs
-@@ -148,9 +148,9 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
+@@ -1,7 +1,10 @@
+ use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
+-use crate::task::{block_current_and_run_next, current_process, current_task};
++use crate::task::{block_current_and_run_next, current_process, current_task, current_task_tid};
+ use crate::timer::{add_timer, get_time_ms};
++use alloc::borrow::ToOwned;
+ use alloc::sync::Arc;
++use alloc::vec;
++use alloc::vec::Vec;
+ /// sleep syscall
+ pub fn sys_sleep(ms: usize) -> isize {
+     trace!(
+@@ -49,12 +52,66 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
+         .map(|(id, _)| id)
+     {
+         process_inner.mutex_list[id] = mutex;
++        process_inner.mutex_deadlock_detect.available[id] = 1;
+         id as isize
+     } else {
+         process_inner.mutex_list.push(mutex);
++        process_inner.mutex_deadlock_detect.available.push(1);
+         process_inner.mutex_list.len() as isize - 1
+     }
+ }
++fn is_safe(
++    available: &[usize],
++    allocation: &[Vec<usize>],
++    need: &[Vec<usize>],
++    t_num: usize,
++) -> bool {
++    let mut work = available.to_owned();
++    let mut all = allocation.to_owned();
++    let mut finish = vec![false; all.len()];
++
++    loop {
++        let mut flag = false;
++
++        for i in 0..t_num {
++            if !finish[i] {
++                let need_res: Vec<_> = need[i]
++                    .iter()
++                    .enumerate()
++                    .filter(|(_, res)| **res > 0)
++                    .map(|(id, _)| id)
++                    .collect();
++
++                if need_res.is_empty() || need_res.iter().all(|&res| need[i][res] <= work[res]) {
++                    // 处理资源分配
++                    for (id_res, item) in work.iter_mut().enumerate() {
++                        *item += all[i][id_res];
++                        all[i][id_res] = 0;
++                    }
++                    finish[i] = true;
++                    flag = true;
++                }
++            }
++        }
++
++        // 退出条件检测
++        if !flag {
++            break;
++        }
++    }
++    let a: Vec<_> = finish
++        .iter()
++        .enumerate()
++        .filter(|(t_id, _)| *t_id < t_num)
++        .collect();
++    println!("finish:{:?}", a);
++    finish
++        .iter()
++        .enumerate()
++        .filter(|(t_id, _)| *t_id < t_num)
++        .all(|(_, &item)| item)
++}
++
+ /// mutex lock syscall
+ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
+     trace!(
+@@ -68,12 +125,41 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
+             .unwrap()
+             .tid
+     );
+-    let process = current_process();
+-    let process_inner = process.inner_exclusive_access();
++    let mut process = current_process();
++    let mut process_inner = process.inner_exclusive_access();
++    let t_num = process_inner.tasks.len();
++    // 死锁检测逻辑
++    if process_inner.enable_deadlock_detect {
++        let banker = &mut process_inner.mutex_deadlock_detect;
++        // 记录need
++        let tid = current_task_tid();
++        if banker.allocation.len() <= tid {
++            banker
++                .allocation
++                .resize(tid + 1, vec![0; banker.available.len()]);
++        }
++        banker.need[tid][mutex_id] += 1;
++        // 安全性检查
++        if !is_safe(&banker.available, &banker.allocation, &banker.need, t_num) {
++            banker.need[tid][mutex_id] -= 1;
++            return -0xdead;
++        }
++    }
      let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
      drop(process_inner);
      drop(process);
-+    mutex.lock();
-     process = current_process();
-     process_inner = process.inner_exclusive_access();
--    mutex.lock();
-     if process_inner.enable_deadlock_detect {
-         let banker = &mut process_inner.mutex_deadlock_detect;
-         let tid = current_task_tid();
-@@ -251,6 +251,7 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
-         banker.available[sem_id] += 1;
-     }
+     mutex.lock();
++    process = current_process();
++    process_inner = process.inner_exclusive_access();
++    if process_inner.enable_deadlock_detect {
++        let banker = &mut process_inner.mutex_deadlock_detect;
++        let tid = current_task_tid();
++        banker.allocation[tid][mutex_id] += 1;
++        banker.need[tid][mutex_id] -= 1;
++        banker.available[mutex_id] -= 1;
++    }
++    drop(process_inner);
++    drop(process);
+     0
+ }
+ /// mutex unlock syscall
+@@ -90,11 +176,17 @@ pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
+             .tid
+     );
+     let process = current_process();
+-    let process_inner = process.inner_exclusive_access();
++    let mut process_inner = process.inner_exclusive_access();
+     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
++    mutex.unlock();
++    if process_inner.enable_deadlock_detect {
++        let banker = &mut process_inner.mutex_deadlock_detect;
++        let tid = current_task_tid();
++        banker.allocation[tid][mutex_id] -= 1;
++        banker.available[mutex_id] += 1;
++    }
      drop(process_inner);
+     drop(process);
+-    mutex.unlock();
+     0
+ }
+ /// semaphore create syscall
+@@ -120,11 +212,16 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
+         .map(|(id, _)| id)
+     {
+         process_inner.semaphore_list[id] = Some(Arc::new(Semaphore::new(res_count)));
++        process_inner.semaphore_deadlock_detect.available[id] = res_count;
+         id
+     } else {
+         process_inner
+             .semaphore_list
+             .push(Some(Arc::new(Semaphore::new(res_count))));
++        process_inner
++            .semaphore_deadlock_detect
++            .available
++            .push(res_count);
+         process_inner.semaphore_list.len() - 1
+     };
+     id as isize
+@@ -143,10 +240,18 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
+             .tid
+     );
+     let process = current_process();
+-    let process_inner = process.inner_exclusive_access();
++    let mut process_inner = process.inner_exclusive_access();
+     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
+-    drop(process_inner);
+     sem.up();
++    // 回收
++    if process_inner.enable_deadlock_detect {
++        let banker = &mut process_inner.semaphore_deadlock_detect;
++        let tid = current_task_tid();
++        banker.allocation[tid][sem_id] -= 1;
++        banker.available[sem_id] += 1;
++    }
++    drop(process_inner);
 +    drop(process);
      0
  }
  /// semaphore down syscall
-@@ -299,6 +300,7 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
-         banker.available[sem_id] -= 1;
-     }
+@@ -162,11 +267,40 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
+             .unwrap()
+             .tid
+     );
+-    let process = current_process();
+-    let process_inner = process.inner_exclusive_access();
++    let mut process = current_process();
++    let mut process_inner = process.inner_exclusive_access();
++    let t_num = process_inner.tasks.len();
++    if process_inner.enable_deadlock_detect {
++        let banker = &mut process_inner.semaphore_deadlock_detect;
++        let tid = current_task_tid();
++        if banker.allocation.len() <= tid {
++            banker
++                .allocation
++                .resize(tid + 1, vec![0; banker.available.len()]);
++        }
++        // 安全检测
++        banker.need[tid][sem_id] += 1;
++        if !is_safe(&banker.available, &banker.allocation, &banker.need, t_num) {
++            banker.need[tid][sem_id] -= 1;
++            return -0xdead;
++        }
++    }
+     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
      drop(process_inner);
++    drop(process);
+     sem.down();
++    process = current_process();
++    process_inner = process.inner_exclusive_access();
++    if process_inner.enable_deadlock_detect {
++        // down完刷新数据
++        let banker = &mut process_inner.semaphore_deadlock_detect;
++        let tid = current_task_tid();
++        banker.allocation[tid][sem_id] += 1;
++        banker.need[tid][sem_id] -= 1;
++        banker.available[sem_id] -= 1;
++    }
++    drop(process_inner);
 +    drop(process);
      0
  }
  /// condvar create syscall
+@@ -247,5 +381,8 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
+ /// YOUR JOB: Implement deadlock detection, but might not all in this syscall
+ pub fn sys_enable_deadlock_detect(_enabled: usize) -> isize {
+     trace!("kernel: sys_enable_deadlock_detect NOT IMPLEMENTED");
+-    -1
++    let process = current_process();
++    let mut process_inner = process.inner_exclusive_access();
++    process_inner.enable_deadlock_detect = _enabled == 1;
++    0
+ }
+diff --git a/os/src/task/mod.rs b/os/src/task/mod.rs
+index 81a25be..4a2877b 100644
+--- a/os/src/task/mod.rs
++++ b/os/src/task/mod.rs
+@@ -34,7 +34,7 @@ pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle, IDLE_PID};
+ pub use manager::{add_task, pid2process, remove_from_pid2process, remove_task, wakeup_task};
+ pub use processor::{
+     current_kstack_top, current_process, current_task, current_trap_cx, current_trap_cx_user_va,
+-    current_user_token, run_tasks, schedule, take_current_task,
++    current_user_token, run_tasks, schedule, take_current_task,current_task_tid
+ };
+ pub use signal::SignalFlags;
+ pub use task::{TaskControlBlock, TaskStatus};
+diff --git a/os/src/task/process.rs b/os/src/task/process.rs
+index c2be1ce..371de77 100644
+--- a/os/src/task/process.rs
++++ b/os/src/task/process.rs
+@@ -43,6 +43,12 @@ pub struct ProcessControlBlockInner {
+     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
+     /// task resource allocator
+     pub task_res_allocator: RecycleAllocator,
++    /// deadlock detection
++    pub enable_deadlock_detect: bool,
++    /// deadlock detect
++    pub mutex_deadlock_detect: MutexDeadlockDetect,
++    /// deadlock detect
++    pub semaphore_deadlock_detect: SemaphoreDeadlockDetect,
+     /// mutex list
+     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
+     /// semaphore list
+@@ -50,6 +56,54 @@ pub struct ProcessControlBlockInner {
+     /// condvar list
+     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+ }
++/// Mutex deadlock detect
++pub struct MutexDeadlockDetect {
++    pub available: Vec<usize>,
++    pub allocation: Vec<Vec<usize>>,
++    pub need: Vec<Vec<usize>>
++}
++impl Clone for MutexDeadlockDetect {
++    fn clone(&self) -> Self {
++        Self {
++            available: self.available.clone(),
++            allocation: self.allocation.clone(),
++            need: self.need.clone()
++        }
++    }
++}
++impl MutexDeadlockDetect {
++    pub fn new() -> Self {
++        Self {
++            available: Vec::new(),
++            allocation: vec![vec![0; 100] ; 100],
++            need: vec![vec![0; 100] ; 100]
++        }
++    }
++}
++/// Semaphore deadlock detect
++pub struct SemaphoreDeadlockDetect {
++    pub available: Vec<usize>,
++    pub allocation: Vec<Vec<usize>>,
++    pub need: Vec<Vec<usize>>
++}
++impl Clone for SemaphoreDeadlockDetect {
++    fn clone(&self) -> Self {
++        Self {
++            available: self.available.clone(),
++            allocation: self.allocation.clone(),
++            need: self.need.clone()
++        }
++    }
++}
++impl SemaphoreDeadlockDetect  {
++    pub fn new() -> Self {
++        Self {
++            available: Vec::new(),
++            allocation: vec![vec![0; 100] ; 100],
++            need: vec![vec![0; 100] ; 100]
++        }
++    }
++}
+ 
+ impl ProcessControlBlockInner {
+     #[allow(unused)]
+@@ -116,6 +170,9 @@ impl ProcessControlBlock {
+                     signals: SignalFlags::empty(),
+                     tasks: Vec::new(),
+                     task_res_allocator: RecycleAllocator::new(),
++                    enable_deadlock_detect: false,
++                    mutex_deadlock_detect: MutexDeadlockDetect::new(),
++                    semaphore_deadlock_detect: SemaphoreDeadlockDetect::new(),
+                     mutex_list: Vec::new(),
+                     semaphore_list: Vec::new(),
+                     condvar_list: Vec::new(),
+@@ -242,6 +299,9 @@ impl ProcessControlBlock {
+                     signals: SignalFlags::empty(),
+                     tasks: Vec::new(),
+                     task_res_allocator: RecycleAllocator::new(),
++                    enable_deadlock_detect: parent.enable_deadlock_detect,
++                    mutex_deadlock_detect: parent.mutex_deadlock_detect.clone(),
++                    semaphore_deadlock_detect: parent.semaphore_deadlock_detect.clone(),
+                     mutex_list: Vec::new(),
+                     semaphore_list: Vec::new(),
+                     condvar_list: Vec::new(),
+diff --git a/os/src/task/processor.rs b/os/src/task/processor.rs
+index b54f9c2..af2380a 100644
+--- a/os/src/task/processor.rs
++++ b/os/src/task/processor.rs
+@@ -84,6 +84,11 @@ pub fn current_task() -> Option<Arc<TaskControlBlock>> {
+     PROCESSOR.exclusive_access().current()
+ }
+ 
++/// 
++pub fn current_task_tid() -> usize {
++    current_task().unwrap().inner_exclusive_access().res.as_ref().unwrap().tid
++}
++
+ /// get current process
+ pub fn current_process() -> Arc<ProcessControlBlock> {
+     current_task().unwrap().process.upgrade().unwrap()
+diff --git a/reports/lab1.md b/reports/lab1.md
+new file mode 100644
+index 0000000..fb557ee
+--- /dev/null
++++ b/reports/lab1.md
+@@ -0,0 +1,51 @@
++## 实验报告
++根据题目要求，我需要获取当前task，以及当前相应id的syscall的使用次数
++1.我为task_mangersh实现了get_current_task接口，用于获取当前执行的task。主要逻辑：获取inner的RefMut，从中取得current_task，并drop掉该RefMut。
++2.我加入了公共的静态二维数组，在syscall中相应id的call前，将相应task使用该call的次数+1.task由get_current_task获取。
++3.在相应地址读写，我将_id转为*mut u8,在unsafe块下解引用。
++## 1.bad测例
++[rustsbi] RustSBI version 0.3.0-alpha.2, adapting to RISC-V SBI v1.0.0
++1.PageFault ,0地址写入数据是错误的,kernel killed it
++2.IllegalInstruction,sret只能在特权级下使用
++3.IllegalInstruction,用户态下无法正确访问sstatus
++## 2.深入理解trap.s
++### 1.L40:
++    刚进入__restore,sp代表了要恢复上下文应用的内核栈顶. 
++    __restore使用情景:
++    1.在中断返回时,用以恢复上下文,从内核栈中恢复寄存器,然后返回用户态.并继续从pc寄存器处执行.
++    2.在应用程序刚启动时,用以读取初始上下文
++### 2.L43-L48
++    恢复上下文
++    sstatus：包含了处理器的状态信息，包括特权级别和中断使能状态。恢复 sstatus 的值确保在返回用户态时，处理器的特权级别和中断状态与陷阱发生前一致。
++    sepc：保存了中断或异常发生时的程序计数器值。恢复 sepc 的值确保在返回用户态时，处理器能够从中断或异常发生的地方继续执行。
++    sscratch：保存了用户栈指针。在切换到用户态之前，将用户栈指针保存到 sscratch 寄存器中，以便在用户态下使用。
++### 3.L50-L56:
++    1.x2是保留栈指针的，这里直接将用户栈指针放入了sscratch,交换后传入sp中
++    2.x4是线程指针寄存器，不需要处理
++
++### 4.L60
++    sp代表用户栈指针,sscratch代表内核栈指针.
++### 5.__restore
++    状态切换发生在sret
++    sret根据sstatus中的SPP位指示切换为用户态。（寄存器中的一个位，0,u_mode;1_,s_mode,s_mode）
++    SPIE=1
++### 6.L13
++    交换后sp指向内核栈，用于保存上下文，sscratch指向用户栈，用于存入2*8(sp),保存用户栈
++### 7.U->S
++    __alltraps,ecall触发异常，执行__alltraps保存上下文进入中断处理
++
++
++## 荣誉准则
++在完成本次实验的过程（含此前学习的过程）中，我曾分别与 以下各位 就（与本次实验相关的）以下方面做过交流，还在代码中对应的位置以注释形式记录了具体的交流对象及内容：
++
++与啊对的对的，Jiang Sheng，一个莫生的人就trap.s：36注释做过交流，后来得知注释的语义范围在36行之前。
++
++与Dynamic_Pigeon就实验报告的提交以及如何确保作业正确做过交流。
++
++此外，我也参考了 以下资料 ，还在代码中对应的位置以注释形式记录了具体的参考来源及内容：
++
++chatgpt
++
++我独立完成了本次实验除以上方面之外的所有工作，包括代码与文档。 我清楚地知道，从以上方面获得的信息在一定程度上降低了实验难度，可能会影响起评分。
++
++我从未使用过他人的代码，不管是原封不动地复制，还是经过了某些等价转换。 我未曾也不会向他人（含此后各届同学）复制或公开我的实验代码，我有义务妥善保管好它们。 我提交至本实验的评测系统的代码，均无意于破坏或妨碍任何计算机系统的正常运转。 我清楚地知道，以上情况均为本课程纪律所禁止，若违反，对应的实验成绩将按“-100”分计。
+\ No newline at end of file
+diff --git a/reports/lab2.md b/reports/lab2.md
+new file mode 100644
+index 0000000..912660e
+--- /dev/null
++++ b/reports/lab2.md
+@@ -0,0 +1,109 @@
++# 一.实现功能
++
++## 1.实现根据虚拟地址的读写:
++### 具体实现:
++根据虚拟地址得到虚拟页号,通过memory_set.translate(vpn)得到pte,判断是否可读可写.
++将pte的bits转为ppn(去掉表示为),并转为物理地址,加上虚拟地址的偏移得到.
++### 注意:
++虚拟地址不能大于1<<39 -1
++
++## 2.实现按页分配的内存映射:
++### 具体实现:
++根据_start和_len得到始末的虚拟地址,_start.floor()和(_start+_len).ceil()得到始末的虚拟页号.
++遍历始末的虚拟页号(末除外),判断是否已经映射.is_vailed
++通过memory_set.map(vpn,ppn)将虚拟页号映射到物理页号.
++### 注意:
++* _start+_len不能大于1<<39 -1
++* 按页映射为左闭右开
++
++## 3.实现按页取消的内存映射:
++### 具体实现:
++根据_start和_len得到始末的虚拟地址,_start.floor()和(_start+_len).ceil()得到始末的虚拟页号.
++遍历始末的虚拟页号(末除外),判断是否已经映射.is_vailed
++通过memory_set.unmap(vpn)取消映射.
++### 注意:
++* _start+_len不能大于1<<39 -1
++* 按页映射为左闭右开
++
++# 二.问答
++## 1.请列举 SV39 页表页表项的组成，描述其中的标志位有何作用？
++组成:
++* PPN:物理页号,56位物理地址,前12位位偏移,13到55为页号
++* VPN:虚拟页号,39位虚拟地址,前12位为偏移,13到38为页号
++* R/W:读/写权限
++* X:执行权限
++* U:用户是否可访问
++* A:A(Accessed) 记录自从页表项上的这一位被清零之后，页表项的对应虚拟页面是否被访问过；
++* D(Dirty) 则记录自从页表项上的这一位被清零之后，页表项的对应虚拟页表是否被修改过。
++* V:有效位
++
++## 2.缺页
++### 缺页的原因
++* 未映射的虚拟页
++* 读/写权限不够
++* 页表项无效
++### 缺页时寄存器
++* stval (Supervisor Trap Value): 保存导致异常的虚拟地址。对于页错误，它会包含无法完成访问的那个虚拟地址。
++* sepc (Supervisor Exception Program Counter): 保存发生异常的指令的地址。OS 处理完异常后，通常会返回到这个地址（或者这个地址的下一条指令，取决于异常类型和处理方式）。对于缺页，通常需要重新执行 sepc 处的指令。
++* scause (Supervisor Cause): 保存异常的原因代码。(缺页原因)
++### lazy策略的好处
++* 节省内存
++* 提高程序启动速度
++* 对于系数内存分配,减少页表建立的开销
++* 按需分配
++### 10g 虚拟地址,所需页表存储
++约等于20MB
++如何实现 Lazy 策略及缺页处理？
++
++- 实现 Lazy 策略：
++  - 当用户请求 mmap 一段内存时，不在页表中立即创建对应的 PTEs，也不分配物理页帧。
++  - 在MapArea中记录下这个虚拟地址范围、权限等信息，并标记为“懒分配”。
++- 缺页处理：
++  - 当进程访问这个范围内的某个地址时，由于没有有效的 PTE（V=0），会触发页错误。
++  - 操作系统捕获到页错误异常，检查 stval 中的故障地址。
++  - 查询MapArea，确认该地址是否属于一个已记录的、合法的、但尚未分配物理页面的区域。
++  - 如果是：
++    1. 分配一个物理页帧。
++    2. 在页表中创建或更新对应的 PTE，将虚拟页号映射到新分配的物理页号，设置正确的权限位（R, W, X, U）并将 V 位置 1。
++    3. 更新 A/D 位（通常硬件会自动处理，但 OS 可能需要软件管理）。
++    4. 返回，并重新执行 sepc 处的指令。
++  - 如果不是 （地址无效或权限不符）：则判断为段错误（Segmentation Fault），终止进程或发送信号。
++## 3.双页表与单页表
++### 在单页表情况下，如何更换页表？
++
++- 在同一个进程的用户态和内核态之间切换时，通常不需要更换页表。 satp 寄存器（指向页表基地址）保持不变。切换只涉及特权级的改变（U-mode <-> S-mode）和栈指针的切换。
++- 页表更换只发生在进程上下文切换时 ，即从一个进程切换到另一个不同的进程时，才需要将 satp 指向新进程的页表基地址，并可能需要刷新 TLB。
++### 单页表情况下，如何控制用户态无法访问内核页面？
++
++通过 PTE 中的 User (U) 位 来控制。
++
++- 对于映射内核代码、数据、栈等的页面，其对应的 PTE 的 U 位被 清零 (U=0) 。
++- 当 CPU 处于用户模式（U-mode）时，如果尝试访问一个 U=0 的页面，硬件会阻止访问并触发页错误异常。
++- 当 CPU 处于super模式（S-mode，即内核态）时，它可以访问 U=0 和 U=1 的页面（只要 V=1 且 R/W/X 权限允许）。
++### 单页表有何优势？
++
++1. 性能较高： 用户态和内核态之间的转换（系统调用、中断返回）不需要切换页表（改变 satp ）和大规模刷新 TLB。TLB 中缓存的用户和内核地址映射可以继续有效，减少了 TLB Miss 的开销，提高了转换速度。
++2. 实现相对简单。
++
++### 双页表实现下，何时需要更换页表？假设你写一个单页表操作系统，你会选择何时更换页表？
++
++- 双页表实现下（如 KPTI）：
++  - 每次 从用户态进入内核态（系统调用、中断、异常）时，需要切换到内核专用的页表（修改 satp ）。
++  - 每次 从内核态返回用户态时，需要切换回用户进程的页表（修改 satp ）。
++  - 在进行 进程上下文切换 时，也需要切换到目标进程的用户页表（如果下一个状态是用户态）或内核页表（如果下一个状态是内核态）。
++- 单页表操作系统下：
++  - 我会选择 仅在进行进程上下文切换时 更换页表。即，当操作系统调度器决定停止当前进程运行，并开始运行另一个不同的进程时，才将 satp 指向新进程的页表基地址。在同一进程的用户态和内核态之间切换时，不更换页表。
++
++# 荣誉准则
++在完成本次实验的过程（含此前学习的过程）中，我曾分别与 以下各位 就（与本次实验相关的）以下方面做过交流，还在代码中对应的位置以注释形式记录了具体的交流对象及内容：
++
++与啊对的对的,交流得知页号的分配为左开右闭
++
++此外，我也参考了 以下资料 ，还在代码中对应的位置以注释形式记录了具体的参考来源及内容：
++
++chatgpt
++
++我独立完成了本次实验除以上方面之外的所有工作，包括代码与文档。 我清楚地知道，从以上方面获得的信息在一定程度上降低了实验难度，可能会影响起评分。
++
++我从未使用过他人的代码，不管是原封不动地复制，还是经过了某些等价转换。 我未曾也不会向他人（含此后各届同学）复制或公开我的实验代码，我有义务妥善保管好它们。 我提交至本实验的评测系统的代码，均无意于破坏或妨碍任何计算机系统的正常运转。 我清楚地知道，以上情况均为本课程纪律所禁止，若违反，对应的实验成绩将按“-100”分计。
++
+diff --git a/reports/lab3.md b/reports/lab3.md
+new file mode 100644
+index 0000000..89f1831
+--- /dev/null
++++ b/reports/lab3.md
+@@ -0,0 +1,51 @@
++# 功能实现
++- stride算法:
++    * 为TCB加上schedule块(struct), 同时预留了pass设置的接口
++    * 为sys_set_priority加入了对priority的设置 
++    * 将TaskManager块改为了用binaryheap存储, 并为TCB分配了Ord特性,每次选取都会取stride最小的调度
++
++- 向前兼容
++    * 重写mmap和munmap(用到了remove_area_with_start_vpn)
++    * 重写了sys_get_time,用到了translate_va
++
++# 问答
++- 实际情况是轮到 p1 执行吗？为什么？
++是p2执行后应是260,但是8bit最大为255, 溢出p2为260 mod 2^8 = 4, 所以p2执行
++-  为什么？尝试简单说明（不要求严格证明）。
++每个进程的 pass 值由 pass = BIG_STRIDE / priority 计算得出。如果所有进程的 priority >= 2 ，那么它们各自的 pass 值必然满足 pass <= BIG_STRIDE / 2 。这意味着任何进程单次执行后，其 stride 值的最大增量不会超过 BIG_STRIDE / 2 。
++- 补全代码
++```
++use core::cmp::Ordering;
++
++struct Stride(u64);
++
++impl PartialOrd for Stride {
++    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
++        let diff = self.0.wrapping_sub(other.0) as i64;
++        if diff < 0 {
++            Some(Ordering::Less) // self 更小
++        } else {
++            Some(Ordering::Greater) // self 更大
++        }
++    }
++}
++
++impl PartialEq for Stride {
++    fn eq(&self, other: &Self) -> bool {
++        false
++    }
++}
++```
++
++# 荣誉准则
++在完成本次实验的过程（含此前学习的过程）中，我曾分别与 以下各位 就（与本次实验相关的）以下方面做过交流，还在代码中对应的位置以注释形式记录了具体的交流对象及内容：
++
++与群友就stride溢出处理进行讨论
++
++此外，我也参考了 以下资料 ，还在代码中对应的位置以注释形式记录了具体的参考来源及内容：
++
++chatgpt
++
++我独立完成了本次实验除以上方面之外的所有工作，包括代码与文档。 我清楚地知道，从以上方面获得的信息在一定程度上降低了实验难度，可能会影响起评分。
++
++我从未使用过他人的代码，不管是原封不动地复制，还是经过了某些等价转换。 我未曾也不会向他人（含此后各届同学）复制或公开我的实验代码，我有义务妥善保管好它们。 我提交至本实验的评测系统的代码，均无意于破坏或妨碍任何计算机系统的正常运转。 我清楚地知道，以上情况均为本课程纪律所禁止，若违反，对应的实验成绩将按“-100”分计。
+diff --git a/reports/lab4.md b/reports/lab4.md
+new file mode 100644
+index 0000000..ba025d5
+--- /dev/null
++++ b/reports/lab4.md
+@@ -0,0 +1,39 @@
++# 功能实现
++- 实现了根据inode_id, 或者name查找inode, 并对其做修改的功能
++- 实现了硬链接, 检查链接名称合法性, 并增加目录size,写入新的entry,同时修改inode的nlink
++- 实现了解除链接, 如果entry不在最后, 就将最后的entry写到删除的entry上,并修改inode的nlink
++- 为File增加stat, 为OSinode完善了File trait的实现
++
++#问答
++- 根 inode 是整个文件系统目录树的起点。所有文件和目录的访问都必须从根 inode 开始，通过解析路径逐级向下查找
++- 如果损坏,os就无法根据rootnode访问其它的目录或者文件,导致无法加载app等
++
++# ch6
++- 
++```
++cat myfile.txt | wc -l
++```
++使用 cat 命令将文件内容输出到标准输出，然后通过管道将其传递给 wc -l 命令， wc -l 会统计其接收到的输入的行数。
++- 进程通信
++    - 消息队列
++    操作系统维护一个或多个消息队列。进程可以将消息发送到特定的队列，其他进程可以从队列中读取消息。发送者和接收者不需要直接连接。
++    - 共享内存
++    操作系统为进程分配一块共享的内存区域，多个进程可以同时访问这块内存。这种方式通常比消息队列更高效，但需要注意同步问题。
++    - 命名管道
++    操作系统为进程创建一个特殊的文件，其他进程可以通过文件路径访问这个文件。这种方式类似于消息队列，但不需要操作系统维护队列
++    - socket
++    操作系统为进程创建一个网络套接字，进程可以通过套接字进行网络通信。这种方式可以实现不同主机之间的进程通信。
++
++
++# 荣誉准则
++在完成本次实验的过程（含此前学习的过程）中，我曾分别与 以下各位 就（与本次实验相关的）以下方面做过交流，还在代码中对应的位置以注释形式记录了具体的交流对象及内容：
++
++与群友就inode的块回收做了讨论
++
++此外，我也参考了 以下资料 ，还在代码中对应的位置以注释形式记录了具体的参考来源及内容：
++
++chatgpt
++
++我独立完成了本次实验除以上方面之外的所有工作，包括代码与文档。 我清楚地知道，从以上方面获得的信息在一定程度上降低了实验难度，可能会影响起评分。
++
++我从未使用过他人的代码，不管是原封不动地复制，还是经过了某些等价转换。 我未曾也不会向他人（含此后各届同学）复制或公开我的实验代码，我有义务妥善保管好它们。 我提交至本实验的评测系统的代码，均无意于破坏或妨碍任何计算机系统的正常运转。 我清楚地知道，以上情况均为本课程纪律所禁止，若违反，对应的实验成绩将按“-100”分计。
+\ No newline at end of file
+diff --git a/reports/lab5.md b/reports/lab5.md
+new file mode 100644
+index 0000000..b1f698d
+--- /dev/null
++++ b/reports/lab5.md
+@@ -0,0 +1,43 @@
++# 实现功能
++- 在ProcessControlBlockInner加入了对mutex和sem的死锁检查块(all[], ava[], need[])
++- 检测前对相应资源的need[] + 1
++- 实现is_safe检测函数, 对finish==false和need <= work的块, 回收allocation和finish=true,对标记flag=true, 当finish没有任何改变, 即本次循环flag==false时退出loop, 利用闭包all,检测finish所有线程是否全是true
++- 若为unsafe, 则回退need, 返回-0xdead
++- 若为safe, 则在down和lock之前drop(process_inner),防止线程堵塞无法释放资源, 在down和lock之后同时更新检查块中的矩阵
++- 为up和unlock加上检查块的更新
++
++# 问答题
++## 资源问题
++- 线程级资源：
++    - 内核栈（KernelStack::kstack_alloc分配的物理页）, 包括线程的
++    - 用户资源（TaskUserRes中的用户栈和trap上下文）
++    - 任务上下文（TaskContext）
++- 进程级资源：
++    - 页表（MemorySet）
++    - 文件描述符（fd_table）
++    - 同步资源（mutex_list/semaphore_list等）
++    - 子进程引用（children）
++    - 信号标志（signals）
++- 引用位置
++    - 需要释放:
++        - 进程块中的tasks
++        - wait_queue中
++    - 不需要
++        - 其它线程的引用
++
++## Mutex实现问题
++- Mutex1的lock里,会一直尝试获取锁, 具体逻辑为当无法获得锁时,直接阻塞,让出cpu,直到被唤醒, 再重新尝试获得锁, unlock中释放锁,并且唤醒一个线程去竞争这个锁.
++- Mutex的lock,在无法获得锁时,直接堵塞,在unlock时,只有等待队列为空才释放锁.
++        - 这里的unlock本质是锁资源的转移, A不释放锁, 而是唤醒一个直接使用这个资源的B线程(它醒来后直接运行临界区后的代码)
++# 荣誉准则
++在完成本次实验的过程（含此前学习的过程）中，我曾分别与 以下各位 就（与本次实验相关的）以下方面做过交流，还在代码中对应的位置以注释形式记录了具体的交流对象及内容：
++
++与群友做了讨论
++
++此外，我也参考了 以下资料 ，还在代码中对应的位置以注释形式记录了具体的参考来源及内容：
++
++chatgpt
++
++我独立完成了本次实验除以上方面之外的所有工作，包括代码与文档。 我清楚地知道，从以上方面获得的信息在一定程度上降低了实验难度，可能会影响起评分。
++
++我从未使用过他人的代码，不管是原封不动地复制，还是经过了某些等价转换。 我未曾也不会向他人（含此后各届同学）复制或公开我的实验代码，我有义务妥善保管好它们。 我提交至本实验的评测系统的代码，均无意于破坏或妨碍任何计算机系统的正常运转。 我清楚地知道，以上情况均为本课程纪律所禁止，若违反，对应的实验成绩将按“-100”分计。
+\ No newline at end of file

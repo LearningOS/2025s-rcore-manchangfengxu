@@ -99,12 +99,12 @@ fn is_safe(
             break;
         }
     }
-    let a: Vec<_> = finish
-        .iter()
-        .enumerate()
-        .filter(|(t_id, _)| *t_id < t_num)
-        .collect();
-    println!("finish:{:?}", a);
+    // let a: Vec<_> = finish
+    //     .iter()
+    //     .enumerate()
+    //     .filter(|(t_id, _)| *t_id < t_num)
+    //     .collect();
+    // println!("finish:{:?}", a);
     finish
         .iter()
         .enumerate()
