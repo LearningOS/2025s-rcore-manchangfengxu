@@ -1,6 +1,7 @@
 use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::task::{block_current_and_run_next, current_process, current_task, current_task_tid};
 use crate::timer::{add_timer, get_time_ms};
+use alloc::borrow::ToOwned;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -59,14 +60,19 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
         process_inner.mutex_list.len() as isize - 1
     }
 }
-fn is_safe(available: &Vec<usize>, allocation: &Vec<Vec<usize>>, need: &Vec<Vec<usize>>, t_num: usize) -> bool {
-    let mut work = available.clone();
-    let mut all = allocation.clone();
+fn is_safe(
+    available: &[usize],
+    allocation: &[Vec<usize>],
+    need: &[Vec<usize>],
+    t_num: usize,
+) -> bool {
+    let mut work = available.to_owned();
+    let mut all = allocation.to_owned();
     let mut finish = vec![false; all.len()];
-    
+
     loop {
-        let mut progress = false;
-        
+        let mut flag = false;
+
         for i in 0..t_num {
             if !finish[i] {
                 let need_res: Vec<_> = need[i]
@@ -75,30 +81,35 @@ fn is_safe(available: &Vec<usize>, allocation: &Vec<Vec<usize>>, need: &Vec<Vec<
                     .filter(|(_, res)| **res > 0)
                     .map(|(id, _)| id)
                     .collect();
-                
-                if !need_res.is_empty() && need_res.iter().all(|&res| need[i][res] <= work[res]) {
+
+                if need_res.is_empty() || need_res.iter().all(|&res| need[i][res] <= work[res]) {
                     // 处理资源分配
-                    for id_res in 0..work.len() {
-                        work[id_res] += all[i][id_res];
+                    for (id_res, item) in work.iter_mut().enumerate() {
+                        *item += all[i][id_res];
                         all[i][id_res] = 0;
                     }
                     finish[i] = true;
-                    progress = true;
-                }
-                if need_res.is_empty() {
-                    finish[i] = true;
+                    flag = true;
                 }
             }
         }
 
         // 退出条件检测
-        if !progress {
+        if !flag {
             break;
         }
     }
-    let a: Vec<_> = finish.iter().enumerate().filter(|(t_id, _)| *t_id < t_num).collect();
+    let a: Vec<_> = finish
+        .iter()
+        .enumerate()
+        .filter(|(t_id, _)| *t_id < t_num)
+        .collect();
     println!("finish:{:?}", a);
-    finish.iter().enumerate().filter(|(t_id, _)| *t_id < t_num).all(|(_, &item)| item==true)
+    finish
+        .iter()
+        .enumerate()
+        .filter(|(t_id, _)| *t_id < t_num)
+        .all(|(_, &item)| item)
 }
 
 /// mutex lock syscall
@@ -126,7 +137,6 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
             banker
                 .allocation
                 .resize(tid + 1, vec![0; banker.available.len()]);
-            
         }
         banker.need[tid][mutex_id] += 1;
         // 安全性检查
@@ -136,6 +146,8 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
         }
     }
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
+    drop(process_inner);
+    process_inner = process.inner_exclusive_access();
     mutex.lock();
     if process_inner.enable_deadlock_detect {
         let banker = &mut process_inner.mutex_deadlock_detect;
@@ -204,7 +216,10 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
         process_inner
             .semaphore_list
             .push(Some(Arc::new(Semaphore::new(res_count))));
-        process_inner.semaphore_deadlock_detect.available.push(res_count);
+        process_inner
+            .semaphore_deadlock_detect
+            .available
+            .push(res_count);
         process_inner.semaphore_list.len() - 1
     };
     id as isize
@@ -268,7 +283,9 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
         }
     }
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
+    drop(process_inner);
     sem.down();
+    process_inner = process.inner_exclusive_access();
     if process_inner.enable_deadlock_detect {
         // down完刷新数据
         let banker = &mut process_inner.semaphore_deadlock_detect;
