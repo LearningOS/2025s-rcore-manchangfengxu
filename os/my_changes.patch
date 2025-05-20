@@ -1,0 +1,31 @@
+diff --git a/os/src/syscall/sync.rs b/os/src/syscall/sync.rs
+index b991ac0..232dce0 100644
+--- a/os/src/syscall/sync.rs
++++ b/os/src/syscall/sync.rs
+@@ -148,9 +148,9 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
+     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
+     drop(process_inner);
+     drop(process);
++    mutex.lock();
+     process = current_process();
+     process_inner = process.inner_exclusive_access();
+-    mutex.lock();
+     if process_inner.enable_deadlock_detect {
+         let banker = &mut process_inner.mutex_deadlock_detect;
+         let tid = current_task_tid();
+@@ -251,6 +251,7 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
+         banker.available[sem_id] += 1;
+     }
+     drop(process_inner);
++    drop(process);
+     0
+ }
+ /// semaphore down syscall
+@@ -299,6 +300,7 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
+         banker.available[sem_id] -= 1;
+     }
+     drop(process_inner);
++    drop(process);
+     0
+ }
+ /// condvar create syscall

@@ -164,6 +164,8 @@ pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
     let process = current_process();
     let inner = process.inner_exclusive_access();
     if let Some(paddr) = inner.memory_set.translate_va(vaddr) {
+        drop(inner);
+        drop(process);
         let us = get_time_us();
         unsafe {
             *(paddr.0 as *mut TimeVal) = TimeVal {

@@ -125,7 +125,7 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
             .unwrap()
             .tid
     );
-    let process = current_process();
+    let mut process = current_process();
     let mut process_inner = process.inner_exclusive_access();
     let t_num = process_inner.tasks.len();
     // 死锁检测逻辑
@@ -147,8 +147,10 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
     }
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
     drop(process_inner);
-    process_inner = process.inner_exclusive_access();
+    drop(process);
     mutex.lock();
+    process = current_process();
+    process_inner = process.inner_exclusive_access();
     if process_inner.enable_deadlock_detect {
         let banker = &mut process_inner.mutex_deadlock_detect;
         let tid = current_task_tid();
@@ -249,6 +251,7 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
         banker.available[sem_id] += 1;
     }
     drop(process_inner);
+    drop(process);
     0
 }
 /// semaphore down syscall
@@ -264,7 +267,7 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
             .unwrap()
             .tid
     );
-    let process = current_process();
+    let mut process = current_process();
     let mut process_inner = process.inner_exclusive_access();
     let t_num = process_inner.tasks.len();
     if process_inner.enable_deadlock_detect {
@@ -284,7 +287,9 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
     }
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
     drop(process_inner);
+    drop(process);
     sem.down();
+    process = current_process();
     process_inner = process.inner_exclusive_access();
     if process_inner.enable_deadlock_detect {
         // down完刷新数据
@@ -295,6 +300,7 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
         banker.available[sem_id] -= 1;
     }
     drop(process_inner);
+    drop(process);
     0
 }
 /// condvar create syscall
